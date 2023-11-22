@@ -42,10 +42,14 @@ module Rdkafka
           topic_metadata ? topic_metadata[:partition_count] : nil
         ]
       end
+      # RC, 11/22/2023: the issue linked in the comment of the poll method below is closed, marked completed.
+      # do we still need to start a polling thread here rather than rely on the one started in the native_kafka constructor?
       start_polling_thread_for_delivery_callbacks
     end
 
     def start_polling_thread_for_delivery_callbacks
+      # RC, 11/22/2023: if we still need this method, need to find where else this @closing is used/updated in the project
+      # it should be getting set to true somewhere for L59 to evaluate to true and break the loop
       @closing = false
       @polling_thread = Thread.new do
         loop do
