@@ -16,7 +16,7 @@ module Rdkafka
       result = Rdkafka::Bindings.rd_kafka_metadata(native_client, topic_flag, native_topic, ptr, 250)
 
       # Error Handling
-      Rdkafka::Error.new(result) unless result.zero?
+      raise Rdkafka::RdkafkaError.new(result) unless result.zero?
 
       metadata_from_native(ptr.read_pointer)
     ensure

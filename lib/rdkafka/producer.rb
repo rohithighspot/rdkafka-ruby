@@ -14,14 +14,41 @@ module Rdkafka
       # Start thread to poll client for delivery callbacks
       @polling_thread = Thread.new do
         loop do
-          Rdkafka::Bindings.rd_kafka_poll(@native_kafka, 250)
-          # Exit thread if closing and the poll queue is empty
-          if @closing && Rdkafka::Bindings.rd_kafka_outq_len(@native_kafka) == 0
-            break
+          begin
+            poll
+            # Exit thread if closing and the poll queue is empty
+            if @closing && outq_len == 0
+              break
+            end
+          rescue => e
+            $stderr.puts "polling thread will exit due to an exception #{e.to_s}"
+            $stderr.puts e.backtrace
+            raise
           end
         end
       end
       @polling_thread.abort_on_exception = true
+    end
+
+    # outq_len provides internals information on the total number of
+    # outstanding outbound messages, in theory, but see rdkafka.h docs on
+    # `rd_kafka_outq_len()` for details.
+    #
+    # This function is only exposed for debugging library issues as it doesn't
+    # quite mean what you would think.
+    def outq_len
+      Rdkafka::Bindings.rd_kafka_outq_len(@native_kafka)
+    end
+
+    # allow explicit polling for callbacks on the underlying native_kafka.
+    # see https://github.com/edenhill/librdkafka/issues/2247
+    #
+    # In theory this should not be necessary because the constructor spawns a thread
+    # which calls this repeatedly with the default value of timeout_ms
+    #
+    # @param timeout_ms [Integer] Timeout of this poll.
+    def poll(timeout_ms: 250)
+      Rdkafka::Bindings.rd_kafka_poll(@native_kafka, timeout_ms)
     end
 
     # Set a callback that will be called every time a message is successfully produced.
