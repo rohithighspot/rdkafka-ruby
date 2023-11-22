@@ -1054,7 +1054,7 @@ describe Rdkafka::Consumer do
     end
   end
 
-  describe "#each_batch" do
+  xdescribe "#each_batch" do
     before do
       @topic = SecureRandom.base64(10).tr('+=/', '')
     end

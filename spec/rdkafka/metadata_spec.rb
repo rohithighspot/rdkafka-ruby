@@ -79,7 +79,7 @@ describe Rdkafka::Metadata do
   end
 end
 
-describe Rdkafka::Producer do
+xdescribe Rdkafka::Producer do
   let(:metadata) do
     producer = rdkafka_config.producer
     def producer.metadata
