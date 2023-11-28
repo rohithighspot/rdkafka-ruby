@@ -603,6 +603,8 @@ module Rdkafka
     #
     # @return [nil]
     def each_batch(max_items: 100, bytes_threshold: Float::INFINITY, timeout_ms: 250, yield_on_error: false, &block)
+      # RC, 11/22/2023: this is new and raises if consumer is closed. does our app code need to handle this now?
+      # earlier we were just breaking out of the loop at L613 if closed
       closed_consumer_check(__method__)
       slice = []
       bytes = 0
