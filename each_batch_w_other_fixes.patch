@@ -1,0 +1,407 @@
+Subject: [PATCH] workaround difficulty getting bundle happy with us
+Error->RdkafkaError. also need 'raise' keyword
+tests of Metadata; Error handling fails
+expose some internals to allow for debugging
+provide some stderr if polling thread must exit
+allow to process messages with exceptions pending
+monotonic_now replaces Time.now, JIC
+yield buffered messages on specific exception
+explain caller need to store_offset
+document each_batch, and name param consistently
+allow for initial empty yields, and use new topic
+allow for timing out just before the deadline
+clear, dont reallocate
+check @closing before we poll
+first pass at each_batch with timeout
+the test passed without the actual 'close' call
+---
+Index: spec/rdkafka/consumer_spec.rb
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/spec/rdkafka/consumer_spec.rb b/spec/rdkafka/consumer_spec.rb
+--- a/spec/rdkafka/consumer_spec.rb	(revision 694660afc1b52d03bdc56a8d25c8a8160a6fbc9b)
++++ b/spec/rdkafka/consumer_spec.rb	(revision b258fc1748b595f55d4b4a7d783445af0372bac0)
+@@ -1,5 +1,6 @@
+ require "spec_helper"
+ require "ostruct"
++require 'securerandom'
+ 
+ describe Rdkafka::Consumer do
+   let(:config) { rdkafka_config }
+@@ -271,6 +272,14 @@
+   describe "#close" do
+     it "should close a consumer" do
+       consumer.subscribe("consume_test_topic")
++      100.times do |i|
++        report = producer.produce(
++          topic:     "consume_test_topic",
++          payload:   "payload #{i}",
++          key:       "key #{i}",
++          partition: 0
++        ).wait
++      end
+       consumer.close
+       expect(consumer.poll(100)).to be_nil
+     end
+@@ -667,6 +676,136 @@
+     end
+   end
+ 
++  describe "#each_batch" do
++    before do
++      @topic = SecureRandom.base64(10).tr('+=/', '')
++    end
++
++    after do
++      @topic = nil
++    end
++
++    def topic_name
++      @topic
++    end
++
++    def produce_n(n)
++      handles = []
++      n.times do |i|
++        handles << producer.produce(
++          topic:     topic_name,
++          payload:   Time.new.to_f.to_s,
++          key:       i.to_s,
++          partition: 0
++        )
++      end
++      handles.each(&:wait)
++    end
++
++    it "should yield arrays of messages" do
++      produce_n 10
++      consumer.subscribe(topic_name)
++      all_yields = []
++      consumer.each_batch(max_items: 10) do |batch|
++        all_yields << batch
++        if batch.any? { |message| message&.key == "9" }
++          break
++        end
++      end
++      expect(all_yields.first).to be_instance_of(Array)
++      expect(all_yields.flatten.size).to eq 10
++      expect(all_yields.flatten.first).to be_a Rdkafka::Consumer::Message
++      non_empty_yields = all_yields.reject { |batch| batch.empty? }
++      expect(non_empty_yields.size).to be < 10
++    end
++
++    it "should yield a partial batch if the timeout is hit with some messages" do
++      consumer.subscribe(topic_name)
++      produce_n 2
++      all_yields = []
++      consumer.each_batch(max_items: 10) do |batch|
++        all_yields << batch
++        if batch.any? { |message| message&.key == "1" }
++          break
++        end
++      end
++      expect(all_yields.flatten.size).to eq 2
++      expect(all_yields.last.size).to eq 2
++    end
++
++    it "should yield [] if nothing is received before the timeout" do
++      consumer.subscribe(topic_name)
++      consumer.each_batch do |batch|
++        expect(batch).to eq([])
++        break
++      end
++    end
++
++    it "should yield sooner than the timeout latency if batch size is reached" do
++      consumer.subscribe(topic_name)
++      produce_n 100
++
++      prev_time = Time.new.to_f
++      yields = []
++      timing = []
++
++      consumer.each_batch(max_items: 10, timeout_ms: 500) do |batch|
++        now = Time.now.to_f
++        yields << batch
++        timing << now - prev_time
++        prev_time = now
++        break if batch&.size > 0
++      end
++      expect(timing.last < 0.5).to be true
++      expect(yields.last.size).to eq 10
++    end
++
++    it "should return if the connection is closing" do
++      consumer.subscribe(topic_name)
++      produce_n 10
++      loop_count = 0
++      consumer.close
++      consumer.each_batch(max_items: 10, timeout_ms: 10) do |batch|
++        loop_count = loop_count + 1
++        break if loop_count > 10
++      end
++      expect(loop_count).to eq 0
++    end
++
++    it "should yield buffered exceptions on rebalance, then break" do
++      config = rdkafka_config({:"enable.auto.commit" => false,
++                               :"enable.auto.offset.store" => false })
++      consumer = config.consumer
++      consumer.subscribe(topic_name)
++      wait_for_assignment consumer
++      loop_count = 0
++      batches_yielded = []
++      iterations = 0
++      poll_count = 0
++      expect(Rdkafka::Bindings)
++        .to receive(:rd_kafka_consumer_poll)
++        .exactly(3).times
++        .and_wrap_original do |method, *args| 
++          poll_count = poll_count + 1
++          if poll_count == 3
++            raise Rdkafka::RdkafkaError
++              .new(27, "partitions ... too ... heavy ... must ... rebalance")
++          else
++            method.call *args
++          end
++        end
++      produce_n 3
++      consumer.each_batch(max_items: 30) do |batch|
++        batches_yielded << batch
++        iterations = iterations + 1
++      end
++      expect(poll_count).to eq 3
++      expect(iterations).to eq 1
++      expect(batches_yielded.size).to eq 1
++      expect(batches_yielded.first.size).to eq 2
++    end
++  end
++
+   describe "a rebalance listener" do
+     it "should get notifications" do
+       listener = Struct.new(:queue) do
+Index: lib/rdkafka/consumer.rb
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/lib/rdkafka/consumer.rb b/lib/rdkafka/consumer.rb
+--- a/lib/rdkafka/consumer.rb	(revision e1047a2d915973602cba203fff277ec5268bbd62)
++++ b/lib/rdkafka/consumer.rb	(revision a7f2784c60e39835cd24d204a8381a4f8fd1fb72)
+@@ -441,5 +441,87 @@
+         end
+       end
+     end
++
++    # Poll for new messages and yield them in batches that may contain
++    # messages from more than one partition.
++    #
++    # Rather than yield each message immediately as soon as it is received,
++    # each_batch will attempt to wait for as long as `timeout_ms` in order
++    # to create a batch of up to but no more than `max_items` in size.
++    #
++    # Said differently, if more than `max_items` are available within
++    # `timeout_ms`, then `each_batch` will yield early with `max_items` in the
++    # array, but if `timeout_ms` passes by with fewer messages arriving, it
++    # will yield an array of fewer messages, quite possibly zero.
++    #
++    # In order to prevent wrongly auto committing many messages at once across
++    # possibly many partitions, callers must explicitly indicate which messages
++    # have been successfully processed as some consumed messages may not have
++    # been yielded yet. To do this, the caller should set
++    # `enable.auto.offset.store` to false and pass processed messages to
++    # {store_offset}. It is also possible, though more complex, to set
++    # 'enable.auto.commit' to false and then pass a manually assembled
++    # TopicPartitionList to {commit}.
++    #
++    # As with `each`, iteration will end when the consumer is closed.
++    #
++    # Exception behavior is more complicated than with `each`, in that if
++    # :yield_on_error is true, and an exception is raised during the
++    # poll, and messages have already been received, they will be yielded to
++    # the caller before the exception is allowed to propogate.
++    #
++    # If you are setting either auto.commit or auto.offset.store to false in
++    # the consumer configuration, then you should let yield_on_error keep its
++    # default value of false because you are gauranteed to see these messages
++    # again. However, if both auto.commit and auto.offset.store are set to
++    # true, you should set yield_on_error to true so you can process messages
++    # that you may or may not see again.
++    #
++    # @param max_items [Integer] Maximum size of the yielded array of messages
++    #
++    # @param timeout_ms [Integer] Timeout of this poll
++    #
++    # @raise [RdkafkaError] When polling fails
++    #
++    # @yield [messages, pending_exception]
++    # @yieldparam messages [Array] An array of received Message
++    # @yieldparam pending_exception [Exception] normally nil, or an exception
++    # which will be propogated after processing of the partial batch is complete.
++    #
++    # @return [nil]
++    def each_batch(max_items: 100, timeout_ms: 250, yield_on_error: false, &block)
++      slice = []
++      loop do
++        break if @closing
++        start_time = monotonic_now
++        end_time = start_time + timeout_ms / 1000.0
++        max_wait = end_time - monotonic_now
++        max_wait_ms = if max_wait <= 0
++                        0   
++                      else
++                        (max_wait * 1000).floor
++                      end 
++        message = nil
++        begin
++          message = poll max_wait_ms
++        rescue Rdkafka::RdkafkaError => error
++          raise unless yield_on_error
++          raise if slice.empty?
++          yield slice.dup, error
++          raise
++        end
++        slice << message if message
++        if slice.size == max_items || monotonic_now >= end_time - 0.001
++          yield slice.dup, nil
++          slice.clear
++        end 
++      end 
++    end
++
++    private
++    def monotonic_now
++      # needed because Time.now can go backwards
++      Process.clock_gettime(Process::CLOCK_MONOTONIC)
++    end
+   end
+ end
+Index: lib/rdkafka/producer.rb
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/lib/rdkafka/producer.rb b/lib/rdkafka/producer.rb
+--- a/lib/rdkafka/producer.rb	(revision a7f2784c60e39835cd24d204a8381a4f8fd1fb72)
++++ b/lib/rdkafka/producer.rb	(revision beeeeeb9906d4f66d72965cf5e04dd749651ca8e)
+@@ -14,16 +14,43 @@
+       # Start thread to poll client for delivery callbacks
+       @polling_thread = Thread.new do
+         loop do
+-          Rdkafka::Bindings.rd_kafka_poll(@native_kafka, 250)
+-          # Exit thread if closing and the poll queue is empty
+-          if @closing && Rdkafka::Bindings.rd_kafka_outq_len(@native_kafka) == 0
+-            break
++          begin
++            poll
++            # Exit thread if closing and the poll queue is empty
++            if @closing && outq_len == 0
++              break
++            end
++          rescue => e
++            $stderr.puts "polling thread will exit due to an exception #{e.to_s}"
++            $stderr.puts e.backtrace
++            raise
+           end
+         end
+       end
+       @polling_thread.abort_on_exception = true
+     end
+ 
++    # outq_len provides internals information on the total number of
++    # outstanding outbound messages, in theory, but see rdkafka.h docs on
++    # `rd_kafka_outq_len()` for details.
++    #
++    # This function is only exposed for debugging library issues as it doesn't
++    # quite mean what you would think.
++    def outq_len
++      Rdkafka::Bindings.rd_kafka_outq_len(@native_kafka)
++    end
++
++    # allow explicit polling for callbacks on the underlying native_kafka.
++    # see https://github.com/edenhill/librdkafka/issues/2247
++    #
++    # In theory this should not be necessary because the constructor spawns a thread
++    # which calls this repeatedly with the default value of timeout_ms
++    #
++    # @param timeout_ms [Integer] Timeout of this poll.
++    def poll(timeout_ms: 250)
++      Rdkafka::Bindings.rd_kafka_poll(@native_kafka, timeout_ms)
++    end
++
+     # Set a callback that will be called every time a message is successfully produced.
+     # The callback is called with a {DeliveryReport}
+     #
+Index: spec/rdkafka/metadata_spec.rb
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/spec/rdkafka/metadata_spec.rb b/spec/rdkafka/metadata_spec.rb
+new file mode 100644
+--- /dev/null	(revision e49a1a9ef2d137419265a871c433903a62fdd85b)
++++ b/spec/rdkafka/metadata_spec.rb	(revision e49a1a9ef2d137419265a871c433903a62fdd85b)
+@@ -0,0 +1,29 @@
++require "spec_helper"
++
++describe Rdkafka::Producer do
++  let(:metadata) do
++    producer = rdkafka_config.producer
++    def producer.metadata
++      ::Rdkafka::Metadata.new(@native_kafka)
++    end
++    producer.metadata
++  end
++
++  it "can be constructed without error" do
++    expect { metadata }.not_to raise_error
++  end
++
++  it "can return topic metadata" do
++    topics = metadata.topics
++    expect(topics).not_to be_empty
++    topic_metadata = topics.first
++    expect(topic_metadata.keys).to include(:topic_name)
++    expect(topic_metadata.keys).to include(:partition_count)
++    expect(topic_metadata.keys).to include(:partitions)
++  end
++
++  it "raises RdkafkaError if rd_kafka_metadata returns an error" do
++    allow(Rdkafka::Bindings).to receive(:rd_kafka_metadata).with(any_args).and_return(42)
++    expect { metadata.topics }.to raise_error(::Rdkafka::RdkafkaError)
++  end
++end
+Index: lib/rdkafka/metadata.rb
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/lib/rdkafka/metadata.rb b/lib/rdkafka/metadata.rb
+--- a/lib/rdkafka/metadata.rb	(revision e49a1a9ef2d137419265a871c433903a62fdd85b)
++++ b/lib/rdkafka/metadata.rb	(revision 0a931f1d3e9eeb94cd7b5e9ad7a532ad8a0b87e8)
+@@ -16,7 +16,7 @@
+       result = Rdkafka::Bindings.rd_kafka_metadata(native_client, topic_flag, native_topic, ptr, 250)
+ 
+       # Error Handling
+-      Rdkafka::Error.new(result) unless result.zero?
++      raise Rdkafka::RdkafkaError.new(result) unless result.zero?
+ 
+       metadata_from_native(ptr.read_pointer)
+     ensure
+Index: lib/rdkafka/version.rb
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/lib/rdkafka/version.rb b/lib/rdkafka/version.rb
+--- a/lib/rdkafka/version.rb	(revision 0a931f1d3e9eeb94cd7b5e9ad7a532ad8a0b87e8)
++++ b/lib/rdkafka/version.rb	(revision 7b086c387634f6e873ee903772b06b9ed79c1c77)
+@@ -1,5 +1,5 @@
+ module Rdkafka
+-  VERSION = "0.8.0.beta.1"
++  VERSION = "0.8.99"
+   LIBRDKAFKA_VERSION = "1.4.0"
+   LIBRDKAFKA_SOURCE_SHA256 = "ae27ea3f3d0d32d29004e7f709efbba2666c5383a107cc45b3a1949486b2eb84"
+ end
